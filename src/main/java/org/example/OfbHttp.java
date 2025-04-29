@@ -18,25 +18,41 @@ import java.util.concurrent.CompletableFuture;
 
 public class OfbHttp {
 
-    private static final ExecutorService executorService = Executors.newCachedThreadPool();
+    public static final ExecutorService executorService = Executors.newCachedThreadPool();
     private static final Map<String, ListenableFuture<OfbResponse>> requestMap = new ConcurrentHashMap<>();
     private static final Map<String, OfbResponse> cache = new ConcurrentHashMap<>();
     private static final Map<String, FutureCallback<OfbResponse>> callbackMap = new ConcurrentHashMap<>();
+    private static final Map<String, String> tagToUrlMap = new ConcurrentHashMap<>();
 
 
     public static ListenableFuture<OfbResponse> execute(OfbRequest request) {
         CompletableFuture<OfbResponse> completableFuture = new CompletableFuture<>();
+
+        if (request.methodType.equalsIgnoreCase("GET") && cache.containsKey(request.url)) {
+            System.out.println("Returning cached response for " + request.url + " " + request.tag);
+            tagToUrlMap.put(request.tag, request.url);
+            return Futures.immediateFuture(cache.get(request.url));
+        }
+
+        if (requestMap.containsKey(request.url)) {
+            System.out.println("Returning in-progress future for " + request.url + " " + request.tag);
+            tagToUrlMap.put(request.tag, request.url);
+            return Futures.immediateFuture(cache.get(request.url));
+        }
+
         ListenableFuture<OfbResponse> listenableFuture = Futures.submit(() -> performRequest(request), executorService);
 
-        requestMap.put(request.tag, listenableFuture);
+        requestMap.put(request.url, listenableFuture);
+        tagToUrlMap.put(request.tag, request.url);
 
         Futures.addCallback(listenableFuture, new ExtendedFutureCallback<OfbResponse>() {
 
             @Override
             public void onSuccess(OfbResponse result) {
-                if (request.methodType.equalsIgnoreCase("GET")) {
-                    cache.put(request.url, result);
+                if (request.methodType.equalsIgnoreCase("GET") && !tagToUrlMap.containsKey(request.tag)) {
+                    return;
                 }
+                cache.put(request.url, result);
                 completableFuture.complete(result);
             }
 
@@ -68,23 +84,45 @@ public class OfbHttp {
     }
 
     public static void cancel(String tag) {
-        ListenableFuture<OfbResponse> future = requestMap.remove(tag);
-        if (future != null) {
-            future.cancel(true);
+        System.out.println("Attempting to cancel request with tag: " + tag);
+        System.out.println("Current tagToUrlMap: " + tagToUrlMap);
 
-            // Retrieve and invoke the onCancel callback
+        String url = tagToUrlMap.get(tag);  // Fetch URL associated with the tag
+
+        if (url != null) {
+            System.out.println("Found URL for tag: " + tag + " -> " + url);
+
+            // Remove only the specific tag from tagToUrlMap
+            tagToUrlMap.remove(tag);
+
+            ListenableFuture<OfbResponse> future = requestMap.remove(url);
+            if (future != null) {
+                boolean wasCancelled = future.cancel(true);
+                System.out.println("Cancellation status for " + tag + ": " + wasCancelled);
+
+                if (wasCancelled) {
+                    cache.remove(url);
+                    System.out.println("Request with tag " + tag + " was canceled and removed from cache.");
+                }
+            } else {
+                System.out.println("No active request found for URL: " + url);
+            }
+
+            // Trigger cancellation callback
             FutureCallback<OfbResponse> callback = callbackMap.remove(tag);
             if (callback instanceof ExtendedFutureCallback) {
+                System.out.println("Triggering onCancel for callback.");
                 ((ExtendedFutureCallback<OfbResponse>) callback).onCancel();
             }
+        } else {
+            System.out.println("Cancel request ignored: No matching request found for tag " + tag);
         }
     }
 
-    private static OfbResponse performRequest(OfbRequest request) throws IOException {
-        if (request.methodType.equalsIgnoreCase("GET") && cache.containsKey(request.url)) {
-            return cache.get(request.url);
-        }
 
+    private static OfbResponse performRequest(OfbRequest request) throws IOException {
+
+        System.out.println("Processing request " + request.url + " " + request.tag);
         HttpURLConnection connection = null;
         try {
             URL url = new URL(request.url);
@@ -136,24 +174,25 @@ public class OfbHttp {
         getHeaders.put("Content-Type", "application/json");
         String getTag = "getTag";
 
-        ListenableFuture<OfbResponse> getResponseFuture = OfbHttp.execute(new OfbRequest("GET", getUrl, getHeaders, getTag));
+        ListenableFuture<OfbResponse>
+            getResponseFuture = OfbHttp.execute(new OfbRequest("GET", getUrl, getHeaders, getTag));
 
-            Futures.addCallback(getResponseFuture, new ExtendedFutureCallback<OfbResponse>() {
-                @Override
-                public void onSuccess(OfbResponse ofbResponse) {
-                    System.out.println("GET Success: " + ofbResponse.getResponseBody());
-                }
+        Futures.addCallback(getResponseFuture, new ExtendedFutureCallback<OfbResponse>() {
+            @Override
+            public void onSuccess(OfbResponse ofbResponse) {
+                System.out.println("GET Success: " + ofbResponse.getResponseBody());
+            }
 
-                @Override
-                public void onFailure(Throwable thrown) {
-                    System.err.println("GET Failure: " + thrown.getMessage());
-                }
+            @Override
+            public void onFailure(Throwable thrown) {
+                System.err.println("GET Failure: " + thrown.getMessage());
+            }
 
-                @Override
-                public void onCancel() {
-                    System.err.println("GET Cancel");
-                }
-            }, executorService);
+            @Override
+            public void onCancel() {
+                System.err.println("GET Cancel");
+            }
+        }, executorService);
 
         //POST Example
         String postUrl = "https://httpbin.org/post";
